@@ -546,42 +546,59 @@ class DefaultLLM(LLM):
         drop_params: Optional[bool] = None,
         stream: Optional[bool] = None,
     ) -> Union[ModelResponse, CustomStreamWrapper]:
+        # 单独收集与 tool calling 相关的参数，避免后面在主 completion 调用里分散拼接。
         tools_args = {}
+        # 某些 OpenAI 兼容参数需要显式声明允许透传给 LiteLLM，这里先预留。
         allowed_openai_params = None
 
+        # 只有在确实传入了工具，并且 tool_choice 为 auto 时，才把工具相关参数传给底层模型。
+        # 这样做可以避免对“不支持 tools 的场景”平白传入无效字段。
         if tools and len(tools) > 0 and tool_choice == "auto":
             tools_args["tools"] = tools
             tools_args["tool_choice"] = tool_choice  # type: ignore
 
+        # 如果通过环境变量开启了 thinking，就把它注入到默认参数里。
+        # 用 setdefault 是为了尊重已有显式配置，不覆盖调用方或模型配置里已经给出的值。
         if THINKING:
             self.args.setdefault("thinking", json.loads(THINKING))
 
+        # 同理，把额外 HTTP headers 从环境变量注入进来，便于统一透传给网关/代理层。
         if EXTRA_HEADERS:
             self.args.setdefault("extra_headers", json.loads(EXTRA_HEADERS))
 
+        # 告诉 LiteLLM 可以对参数做兼容性调整，帮助不同 provider 之间做适配。
         litellm.modify_params = True
 
+        # 如果配置了 reasoning_effort，就把它作为允许透传的 OpenAI 参数之一。
+        # 这里额外维护 allowed_openai_params，是为了兼容当前 LiteLLM 版本的参数过滤行为。
         if REASONING_EFFORT:
             self.args.setdefault("reasoning_effort", REASONING_EFFORT)
             allowed_openai_params = [
                 "reasoning_effort"
             ]  # can be removed after next litelm version
 
+        # 把实例已有的 allowed_openai_params 合并进来，避免这里新设置后把旧配置冲掉。
         existing_allowed = self.args.pop("allowed_openai_params", None)
         if existing_allowed:
             if allowed_openai_params is None:
                 allowed_openai_params = []
             allowed_openai_params.extend(existing_allowed)
 
+        # 仅当调用方没有显式给 temperature 时，才回退到实例默认参数体系里。
         self.args.setdefault("temperature", temperature)
 
         # Get the litellm module to use (wrapped or unwrapped)
+        # 如果配置了 tracer，就对 litellm 做一层包装，给后续 completion 打 tracing 埋点。
+        # 否则直接使用原始 litellm 模块。
         litellm_to_use = self.tracer.wrap_llm(litellm) if self.tracer else litellm
 
         # Strip internal fields (e.g. token_count cache) so provider APIs only
         # receive valid message schema fields.  Shallow-copy only when needed to
         # avoid mutating the caller's dicts (which would invalidate the cache).
+        # 这些字段是 Holmes 内部自己挂在 message 上的缓存/辅助信息，不能直接发给 provider API。
         _INTERNAL_FIELDS = {"token_count"}
+        # 只有消息里真的包含内部字段时才浅拷贝并剔除，避免无谓复制。
+        # 这样既能保护调用方原始消息对象，又能尽量少影响性能。
         sanitized_messages: List[Dict[str, Any]] = [
             {k: v for k, v in m.items() if k not in _INTERNAL_FIELDS}
             if m.keys() & _INTERNAL_FIELDS
@@ -589,19 +606,25 @@ class DefaultLLM(LLM):
             for m in messages
         ]
 
+        # 对 Robusta AI 这种代理模型，先把模型名转换成 LiteLLM 更容易接受的形式。
         litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
 
         # When Azure AD (Entra ID) token auth is enabled, obtain a cached token
         # and pass it to litellm instead of an API key.
+        # 额外准备 Azure AD token 模式下才需要的参数。
         azure_ad_kwargs: Dict[str, Any] = {}
         if AZURE_AD_TOKEN_AUTH and litellm_model_name.startswith("azure/"):
             # For LiteLLM Azure provider, pass the bearer token via azure_ad_token
             # LiteLLM will send it as Authorization: Bearer <token>
+            # 启用 Entra ID 时，动态取一个 bearer token 传给 LiteLLM。
             azure_ad_kwargs["azure_ad_token"] = get_azure_ad_token()
             # Also, ensure we do not leak stale API keys when using Entra ID
             # Leave api_key as None in completion call when AZURE_AD_TOKEN_AUTH is enabled
+            # 同时把 api_key 清掉，避免在使用 AAD 鉴权时意外混入过期或不该使用的 API key。
             self.api_key = None
 
+        # 真正发起底层 completion 调用。
+        # 这里把通用消息参数、工具参数、provider 特殊参数，以及 Holmes 的默认 args 一起汇总传下去。
         result = litellm_to_use.completion(
             model=litellm_model_name,
             api_key=self.api_key,
@@ -618,17 +641,20 @@ class DefaultLLM(LLM):
             **self.args,
             cache_control_injection_points=[
                 {
+                    # 在最后一条消息上注入 cache_control，帮助支持的 provider 更高效地复用缓存。
                     "location": "message",
                     "index": -1,  # -1 targets the last message.
                 }
             ],
         )
 
+        # LiteLLM 在非流式和流式模式下会返回两种不同类型，这里做显式分支，方便调用方拿到稳定类型。
         if isinstance(result, ModelResponse):
             return result
         elif isinstance(result, CustomStreamWrapper):
             return result
         else:
+            # 如果返回了未知类型，说明底层行为和当前代码假设不一致，直接抛错更容易发现兼容性问题。
             raise Exception(f"Unexpected type returned by the LLM {type(result)}")
 
     def get_maximum_output_token(self) -> int:

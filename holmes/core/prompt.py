@@ -107,11 +107,21 @@ def is_component_enabled(
     - If env var allows component: API override decides, or use default
     - Default is enabled for most components, except those in DISABLED_BY_DEFAULT
     """
+    # 先检查环境变量层面的总开关。
+    # 这是最高优先级，因为环境变量通常代表部署/运行时的强约束，
+    # 需要能在不改代码的情况下统一禁止某些 prompt 组件。
     env_allowed = is_prompt_allowed_by_env(component)
     if not env_allowed:
+        # 只要环境变量不允许，这个组件就必须关闭；
+        # 即使调用方在 overrides 里显式打开，也不能越过运行时策略。
         return False  # env var wins, can't override to enabled
     if overrides and component in overrides:
+        # 环境变量允许后，再看调用方有没有传入更细粒度的 API 覆盖。
+        # 这样做的好处是：同一套默认行为下，不同调用场景仍可按需裁剪组件。
         return overrides[component]  # env allows, API decides
+    # 当前两层都没有明确指定时，回落到默认策略：
+    # 大多数组件默认开启，只有 DISABLED_BY_DEFAULT 里的组件默认关闭。
+    # 这种设计能让常用能力默认可用，同时把更敏感或更昂贵的内容改成显式开启。
     return component not in DISABLED_BY_DEFAULT  # env allows, no override, use default
 
 
@@ -189,34 +199,65 @@ def build_system_prompt(
     """
 
     def is_enabled(component: PromptComponent) -> bool:
+        # 统一走同一个开关判断入口，避免下面重复传 overrides，
+        # 也让系统提示词各组件的启停规则保持一致。
         return is_component_enabled(component, prompt_component_overrides)
 
+    # 先单独算出 toolset instructions 是否启用，后面会同时影响：
+    # 1. 模板里的布尔开关
+    # 2. 是否真的把 toolsets 明细传给模板
+    # 这样做是为了避免“组件关闭了，但数据还传进模板”带来的歧义和无效上下文。
     toolset_instructions_enabled = is_enabled(PromptComponent.TOOLSET_INSTRUCTIONS)
 
+    # 构造模板上下文，交给 generic_ask.jinja2 统一渲染系统提示词。
+    # 这里大部分字段都拆成 “是否启用” + “真实内容” 两层，
+    # 原因是模板更适合根据布尔开关决定是否渲染某个 section，
+    # Python 侧则负责准备好干净、裁剪后的输入数据。
     template_context = {
+        # 注入当前 Holmes 版本，方便模板在需要时输出版本相关说明。
         "holmes_version": get_version(),
+        # 控制系统提示词中的基础介绍部分是否出现。
         "intro_enabled": is_enabled(PromptComponent.INTRO),
+        # ask_user 既受调用方能力控制，也受 prompt 组件开关控制；
+        # 两者都满足时才启用，避免 server/CLI 能力与模板文案不一致。
         "ask_user_enabled": ask_user_enabled and is_enabled(PromptComponent.ASK_USER),
+        # 控制是否向模型注入 TodoWrite 的使用规范。
         "todowrite_enabled": is_enabled(PromptComponent.TODOWRITE_INSTRUCTIONS),
+        # AI safety 默认可能是关闭的，所以这里显式带上开关结果。
         "ai_safety_enabled": is_enabled(PromptComponent.AI_SAFETY),
+        # 告诉模板是否要渲染 toolset 说明区块。
         "toolset_instructions_enabled": toolset_instructions_enabled,
+        # 控制权限错误相关的额外指导是否出现。
         "permission_errors_enabled": is_enabled(PromptComponent.PERMISSION_ERRORS),
+        # 控制通用行为规范说明是否出现。
         "general_instructions_enabled": is_enabled(
             PromptComponent.GENERAL_INSTRUCTIONS
         ),
+        # 控制输出风格指南是否注入到系统提示词中。
         "style_guide_enabled": is_enabled(PromptComponent.STYLE_GUIDE),
+        # runbooks 既要“对象存在且有内容”，又要组件开关允许，才值得在模板中启用。
+        # 这样做是为了避免模板渲染出空的 runbook 区块，徒增上下文噪音。
         "runbooks_enabled": bool(runbooks and getattr(runbooks, "catalog", True))
         and is_enabled(PromptComponent.TIME_RUNBOOKS),
+        # cluster_name 关闭时直接传 None，而不是传原值，
+        # 这样模板可以更简单地用“是否为空”判断是否渲染该信息。
         "cluster_name": cluster_name
         if is_enabled(PromptComponent.CLUSTER_NAME)
         else None,
+        # 只有启用了 toolset instructions 才把 toolsets 列表真正传入模板，
+        # 原因是这些内容通常较长，关闭时应当一并裁掉，减少无效 token 消耗。
         "toolsets": toolsets if toolset_instructions_enabled else [],
+        # 额外 system prompt 补充说明同样受组件开关控制；
+        # 关闭时传空字符串，避免旧调用方传值后仍被意外拼进最终提示词。
         "system_prompt_additions": system_prompt_additions
         if is_enabled(PromptComponent.SYSTEM_PROMPT_ADDITIONS)
         else "",
     }
 
+    # 使用统一模板渲染最终系统提示词。
     result = load_and_render_prompt("builtin://generic_ask.jinja2", template_context)
+    # 如果模板最终产物为空白，就返回 None 而不是空字符串。
+    # 这样上层在组装 messages 时可以直接跳过 system role，逻辑更干净。
     return result if result and result.strip() else None
 
 

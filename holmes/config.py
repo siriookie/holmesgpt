@@ -268,8 +268,11 @@ class Config(RobustaBaseConfig):
 
     def create_console_tool_executor(
         self,
+        # 可选的数据访问层；某些 toolset 需要通过它访问数据库或平台配置。
         dal: Optional["SupabaseDal"],
+        # 是否强制刷新 toolset 状态，例如重新探测某些集成当前是否可用。
         refresh_status: bool = False,
+        # 事件回调，用于把 toolset 加载进度或状态变化通知给 CLI/UI。
         on_event: EventCallback = None,
     ) -> ToolExecutor:
         """
@@ -281,9 +284,13 @@ class Config(RobustaBaseConfig):
         2. toolsets from config file will override and be merged into built-in toolsets with the same name.
         3. Custom toolsets from config files which can not override built-in toolsets
         """
+        # 先让 toolset_manager 解析并筛出“适用于 console”的工具集合。
+        # 这里同时会按既定优先级完成内置 toolset、配置文件覆盖和自定义 toolset 的合并。
         cli_toolsets = self.toolset_manager.list_console_toolsets(
             dal=dal, refresh_status=refresh_status, on_event=on_event
         )
+        # 再把最终的 toolset 列表封装成 ToolExecutor。
+        # 原因是上层不需要关心每个工具来自哪个 toolset，只需要一个统一的执行入口。
         return ToolExecutor(cli_toolsets, on_event=on_event)
 
     def create_agui_tool_executor(self, dal: Optional["SupabaseDal"]) -> ToolExecutor:
@@ -342,18 +349,30 @@ class Config(RobustaBaseConfig):
 
     def create_console_toolcalling_llm(
         self,
+        # 可选的数据访问层，某些 toolset 会通过它读写持久化数据。
         dal: Optional["SupabaseDal"] = None,
+        # 是否强制刷新 console toolset 的状态缓存。
         refresh_toolsets: bool = False,
+        # tracing 对象，用于记录模型与工具调用链路。
         tracer=None,
+        # 可覆盖配置中的默认模型名。
         model_name: Optional[str] = None,
+        # 工具结果落盘目录；传入后可保存工具执行产物供后续查看。
         tool_results_dir: Optional[Path] = None,
+        # 初始化和执行过程中的事件回调，通常用于 CLI/交互界面刷新进度。
         on_event: EventCallback = None,
     ) -> "ToolCallingLLM":
+        # 延迟导入以避免模块初始化时产生不必要的循环依赖或启动开销。
         from holmes.core.tool_calling_llm import ToolCallingLLM
 
-        # Create LLM first so model info appears during toolset loading
+        # 先创建 LLM，再创建 tool executor。
+        # 原因是 console 场景下 toolset 加载过程会展示初始化进度，
+        # 先拿到 LLM 信息可以更早把模型名显示给用户，提升可观测性。
         llm = self._get_llm(tracer=tracer, model_key=model_name, on_event=on_event)
+        # 创建面向 console 的工具执行器，它负责装配可用工具及其状态。
         tool_executor = self.create_console_tool_executor(dal, refresh_toolsets, on_event=on_event)
+        # 把“模型 + 工具执行器 + 最大步骤数”组合成统一的 ToolCallingLLM。
+        # 这样上层只需要面向一个对象调用，不必分别协调模型和工具系统。
         return ToolCallingLLM(
             tool_executor,
             self.max_steps,
@@ -516,35 +535,53 @@ class Config(RobustaBaseConfig):
     # TODO: move this to the llm model registry
     def _get_llm(
         self,
+        # 可选的模型键；传入后优先选择该模型，否则走配置里的默认模型。
         model_key: Optional[str] = None,
+        # tracing 对象，用于记录模型调用链路。
         tracer=None,
+        # 事件回调，通常用于把“模型已加载”等状态通知给 CLI/UI。
         on_event: EventCallback = None,
     ) -> "DefaultLLM":
+        # 把用户请求的模型记到 Sentry 上，方便线上排查“实际请求了哪个模型”。
         sentry_sdk.set_tag("requested_model", model_key)
+        # 从模型注册表中取出最终生效的模型配置。
         model_entry = self.llm_model_registry.get_model_params(model_key)
+        # 转成普通 dict，并去掉值为 None 的字段，避免把空配置继续传下去。
         model_params = model_entry.model_dump(exclude_none=True)
+        # 先拿全局默认的 api_base / api_version，后面如果模型级别有覆盖再替换。
         api_base = self.api_base
         api_version = self.api_version
+        # 某些模型走 Robusta 自己的凭证体系，因此需要单独识别。
         is_robusta_model = model_params.pop("is_robusta_model", False)
         sentry_sdk.set_tag("is_robusta_model", is_robusta_model)
         if is_robusta_model:
-            # we set here the api_key since it is being refresh when exprided and not as part of the model loading.
+            # Robusta 模型的 token 可能会过期并被动态刷新，所以不能在模型注册阶段就固化。
+            # 因此这里在真正创建 LLM 前临时取一次最新凭证。
             account_id, token = self.dal.get_ai_credentials()
             api_key = f"{account_id} {token}"
         else:
+            # 非 Robusta 模型直接从模型配置里读取 api_key。
             api_key = model_params.pop("api_key", None)
             if api_key is not None:
+                # 配置层通常把密钥包装成 Secret 类型，这里要还原成真实字符串给底层客户端。
                 api_key = api_key.get_secret_value()
 
+        # `model` 是真正传给底层 LLM SDK/provider 的模型标识。
         model = model_params.pop("model")
         # It's ok if the model does not have api base and api version, which are defaults to None.
         # Handle both api_base and base_url - api_base takes precedence
+        # 兼容两种命名：`api_base` 和 `base_url`，并且优先使用 `api_base`。
         model_api_base = model_params.pop("api_base", None)
         model_base_url = model_params.pop("base_url", None)
+        # 优先级是：模型级配置 > 全局配置。
         api_base = model_api_base or model_base_url or api_base
+        # api_version 也允许被模型级配置覆盖。
         api_version = model_params.pop("api_version", api_version)
+        # 展示名优先取显式 name，其次取 model_key，最后退回到底层 model 标识。
+        # 这样做的原因是展示名不一定等于 provider 真正使用的模型 ID，分开更利于用户理解和排查。
         model_name = model_params.pop("name", None) or model_key or model
         sentry_sdk.set_tag("model_name", model_name)
+        # 统一在这里构造 DefaultLLM，把通用参数和剩余 provider 参数一起传入。
         llm = DefaultLLM(
             model=model,
             api_key=api_key,
@@ -555,16 +592,21 @@ class Config(RobustaBaseConfig):
             name=model_name,
             is_robusta_model=is_robusta_model,
         )  # type: ignore
+        # 读取模型能力信息并格式化，主要用于初始化日志和界面提示。
         context_size = self._format_token_count(llm.get_context_window_size())
         max_response = self._format_token_count(llm.get_maximum_output_token())
+        # 告诉用户当前模型来源于哪里：默认值还是显式配置。
         if self._model_source and self._model_source != "default":
             source_hint = f"configured {self._model_source}"
         else:
             source_hint = "default, change with --model, for all options see https://holmesgpt.dev/ai-providers"
+        # 组装一条可读性较高的模型加载提示，展示模型名、上下文窗口和最大输出长度。
         msg = f"Model: {model_name}, {context_size} context, {max_response} max response ({source_hint})"
         display_logger.info(msg)
         if on_event is not None:
+            # 如果有 UI/CLI 监听事件，就把“模型已加载”事件发出去，驱动界面更新。
             on_event(StatusEvent(kind=StatusEventKind.MODEL_LOADED, name=model_name, message=msg))
+        # 返回已经准备好的 LLM 实例，供上层继续装配到 ToolCallingLLM 中。
         return llm
 
     def get_models_list(self) -> List[str]:

@@ -1836,17 +1836,26 @@ def handle_tool_approval(
         - approved: True if user approves, False if denied
         - feedback: User's optional feedback message when denying
     """
+    # 取出当前待审批命令的人类可读描述，后面会直接展示给用户确认。
     command = pending_approval.description
+    # 取出建议持久化授权的命令前缀列表。
+    # 这样设计是为了把“长期授权”限制在相对稳定的前缀模式上，
+    # 避免一次确认误扩大成对任意命令的放行。
     prefixes = pending_approval.params.get("suggested_prefixes", [])
 
-    # Format prefixes for display
+    # 把前缀整理成可展示文本，供菜单文案直接使用。
     if prefixes:
+        # 有前缀时用逗号拼接，方便用户一次看清会被加入 allow list 的范围。
         prefixes_display = ", ".join(f"{p}" for p in prefixes)
     else:
+        # 没有前缀时使用占位文本，避免界面出现空白导致语义不清。
         prefixes_display = "<command>"
 
     # Build command panel — passed as header to the menu so everything
     # lives inside a single transient Rich Live (auto-erased on exit).
+    # 用醒目的面板先展示待执行命令，让用户在做选择前看到完整上下文。
+    # 之所以作为 header 交给内联菜单，是为了让命令展示和选项处在同一个临时 UI 中，
+    # 用户完成选择后可以一起擦除，不污染主对话界面。
     panel = Panel(
         f"  {command or 'unknown'}",
         title="[bold]Approve bash command?[/bold]",
@@ -1855,28 +1864,44 @@ def handle_tool_approval(
         padding=(1, 1),
     )
 
+    # 定义审批菜单：
+    # 1. 仅本次放行
+    # 2. 本次放行并记住同前缀命令，减少重复确认
+    # 3. 拒绝并告诉 Holmes 应该如何调整
     options = [
         "Yes",
         f"Yes, and automatically approve '{prefixes_display}' in the future",
         "No, and tell Holmes what to do differently",
     ]
 
+    # 运行内联菜单并拿到用户选择结果。
+    # 这里复用统一菜单逻辑，可以保持交互方式和键盘操作的一致性。
     result = _run_inline_menu(options, console, header=panel)
 
     if result == 0:  # Yes
+        # 用户只批准这一次，不写入长期授权规则，默认更安全。
         return True, None
     elif result == 1:  # Yes, save
         if prefixes:
+            # 只有真的拿到了建议前缀，才有意义把规则持久化。
+            # 否则无法形成可复用、可控的授权范围。
             _save_approved_prefixes(prefixes)
             console.print(f"[green]✓ Saved `{prefixes_display}` to allow list[/green]")
+        # 这里无论是否真正保存了前缀，都表示当前命令已经得到批准。
         return True, None
     else:  # No (option 3) or Cancelled (Esc) - prompt for optional feedback
+        # 拒绝或取消后，再给用户一个可选反馈入口。
+        # 这样做的原因是：单纯拒绝只能阻止当前命令，
+        # 但补充反馈能让 AI 知道应该缩小权限、改写命令，或换一种更合适的执行方式。
         temp_session = PromptSession(history=InMemoryHistory())  # type: ignore
+        # 使用无历史的临时会话，避免把一次性的审批反馈混入正常输入历史。
         feedback_prompt = temp_session.prompt(
             [("class:prompt", "Optional feedback for the AI (press Enter to skip): ")],
             style=style,
         )
+        # 去掉空白；如果用户没有输入任何内容，就用 None 明确表示“无反馈”。
         feedback = feedback_prompt.strip() if feedback_prompt.strip() else None
+        # 返回拒绝决定，并把用户的附加反馈交给上层逻辑继续处理。
         return False, feedback
 
 
@@ -2252,33 +2277,53 @@ def _wait_for_completion_or_escape(
 
 
 def run_interactive_loop(
+    # 已经装配好的 ToolCallingLLM，负责模型推理和工具调用。
     ai: ToolCallingLLM,
+    # Rich console，用于渲染交互输出。
     console: Console,
+    # 可选的首轮用户输入；如果有，会直接作为第一问执行。
     initial_user_input: Optional[str],
+    # 首轮提问时要附加到上下文里的文件列表。
     include_files: Optional[List[Path]],
+    # 是否自动展示每次工具调用的输出。
     show_tool_output: bool,
+    # tracing 对象；未传入时会退化为 DummyTracer。
     tracer=None,
+    # 可选 runbook 集合，用于构建初始 ask 消息。
     runbooks=None,
+    # 追加到 system prompt 的额外说明。
     system_prompt_additions: Optional[str] = None,
+    # 是否在后台检查新版本。
     check_version: bool = True,
+    # 可选的反馈回调；存在时才开放 `/feedback`。
     feedback_callback: Optional[FeedbackCallback] = None,
+    # 若指定，则每轮回答后把会话保存到 JSON 文件。
     json_output_file: Optional[str] = None,
+    # 强制拒绝 bash 审批请求。
     bash_always_deny: bool = False,
+    # 强制放行 bash 审批请求。
     bash_always_allow: bool = False,
+    # 对 prompt 组件做细粒度开关控制，例如 fast mode 会关闭部分组件。
     prompt_component_overrides: Optional[Dict[PromptComponent, bool]] = None,
+    # 当前会话配置；某些 slash 命令会用到。
     config: Optional[Config] = None,
+    # 配置文件路径，供交互态配置编辑器使用。
     config_file_path: Optional[Path] = None,
 ) -> None:
     # Enable CLI mode for bash prefix loading (server mode doesn't call this)
+    # 交互模式是 CLI 专用路径，这里显式打开 CLI mode，确保 bash 前缀与相关行为按 CLI 规则工作。
     enable_cli_mode()
 
     # Silence display loggers — the interactive loop renders from stream events instead
+    # 交互循环会自己根据流式事件渲染界面，所以要静默普通展示 logger，避免两套输出互相打架。
     silence_display_loggers()
 
     # Initialize tracer - use DummyTracer if no tracer provided
     if tracer is None:
+        # 用 DummyTracer 兜底，可以让下面的 tracing 调用统一写法，不必到处判空。
         tracer = DummyTracer()
 
+    # prompt_toolkit 的样式配置，控制输入提示和底部工具栏的颜色。
     style = Style.from_dict(
         {
             "prompt": USER_COLOR,
@@ -2293,8 +2338,10 @@ def run_interactive_loop(
     # default: interactive approval handler
     approval_callback: Optional[ApprovalCallback] = None
     if bash_always_allow:
+        # 全量放行模式下直接返回批准，不再弹交互审批。
         approval_callback = lambda _: (True, None)
     elif not bash_always_deny:
+        # 默认模式下，把审批请求交给交互式确认界面。
         def approval_handler(
             pending_approval: PendingToolApproval,
         ) -> tuple[bool, Optional[str]]:
@@ -2310,12 +2357,14 @@ def run_interactive_loop(
     # TODO: remove unsupported_commands support once we implement feedback callback
     unsupported_commands = []
     if feedback_callback is None:
+        # 没有反馈回调时，不向补全里暴露 `/feedback`，避免用户看到不可用命令。
         unsupported_commands.append(SlashCommands.FEEDBACK.command)
     slash_completer = SlashCommandCompleter(unsupported_commands)
     executable_completer = ConditionalExecutableCompleter()
     show_completer = ShowCommandCompleter()
     path_completer = SmartPathCompleter()
 
+    # 把多种补全器合并起来，让普通问题、slash 命令、路径和 show 命令共享同一个输入框。
     command_completer = merge_completers(
         [slash_completer, executable_completer, show_completer, path_completer]
     )
@@ -2323,11 +2372,14 @@ def run_interactive_loop(
     # Use file-based history
     history_file = os.path.join(config_path_dir, "history")
 
+    # 确保历史记录目录存在，并把会话历史持久化到文件，方便下次上下箭头回看。
     os.makedirs(os.path.dirname(history_file), exist_ok=True)
     history = FileHistory(history_file)
     if initial_user_input:
+        # 如果首轮问题是外部传进来的，也写入 history，保持交互体验一致。
         history.append_string(initial_user_input)
 
+    # 收集用户反馈相关元数据，并记录当前使用的 LLM 信息。
     feedback = Feedback()
     feedback.metadata.update_llm(ai.llm)
 
@@ -2339,6 +2391,7 @@ def run_interactive_loop(
     def clear_version_message():
         nonlocal version_message
         version_message = ""
+        # 版本提示更新后主动触发界面重绘，让底部工具栏立即刷新。
         session.app.invalidate()
 
     def on_version_check_complete(result):
@@ -2358,6 +2411,8 @@ def run_interactive_loop(
         buffer = event.app.current_buffer
         if buffer.text:
             nonlocal status_message
+            # 输入框里有内容时，第一次 Ctrl+C 只清空输入，不直接退出。
+            # 这样可以减少误触导致整场会话退出。
             status_message = f"Input cleared. Use {SlashCommands.EXIT.command} or Ctrl+C again to quit."
             buffer.reset()
 
@@ -2374,6 +2429,7 @@ def run_interactive_loop(
             raise KeyboardInterrupt()
 
     def get_bottom_toolbar():
+        # 底部工具栏同时承载“输入已清空”提示和“版本更新”提示。
         messages = []
 
         # Ctrl-c status message (red background)
@@ -2399,21 +2455,25 @@ def run_interactive_loop(
 
     # Start background version check
     if check_version:
+        # 版本检查放后台执行，避免阻塞用户立刻开始提问。
         check_version_async(on_version_check_complete)
 
     input_prompt = [("class:prompt", "User: ")]
 
     welcome_banner = WELCOME_BANNER
     if feedback_callback:
+        # 只有当前会话真的支持反馈时，欢迎语里才提示 `/feedback`。
         welcome_banner += f", [bold]{SlashCommands.FEEDBACK.command}[/bold] for feedback"
     console.print(welcome_banner)
 
     if not initial_user_input:
+        # 没有首轮问题时，展示样例问题菜单，帮助用户快速开始。
         sample = _show_sample_questions_menu(console)
         if sample:
             initial_user_input = sample
 
     if initial_user_input:
+        # 首轮输入来自 CLI 参数或样例菜单时，先回显给用户。
         console.print(
             f"\n[bold {USER_COLOR}]User:[/bold {USER_COLOR}] {initial_user_input}"
         )
@@ -2426,12 +2486,14 @@ def run_interactive_loop(
     while True:
         try:
             if initial_user_input:
+                # 首轮优先消费传入的问题，之后再进入真正的 prompt 循环。
                 user_input = initial_user_input
                 initial_user_input = None
             else:
                 user_input = session.prompt(input_prompt, style=style)  # type: ignore
 
             if user_input.startswith("/"):
+                # slash 命令走控制分支，而不是发给模型。
                 original_input = user_input.strip()
                 command = original_input.lower()
                 # Handle prefix matching for slash commands
@@ -2473,6 +2535,8 @@ def run_interactive_loop(
                         f"[bold {STATUS_COLOR}]Screen cleared and context reset. "
                         f"You can now ask a new question.[/bold {STATUS_COLOR}]"
                     )
+                    # `/clear` 不只是清屏，还要清掉对话上下文和工具历史。
+                    # 原因是用户通常期望它开启一段全新的会话，而不是只擦掉屏幕显示。
                     messages = None
                     last_response = None
                     all_tool_calls_history.clear()
@@ -2540,8 +2604,10 @@ def run_interactive_loop(
                     console.print(f"Unknown command: {command}")
                     continue
             elif not user_input.strip():
+                # 空输入直接忽略，避免产生无意义的一轮调用。
                 continue
 
+            # 每轮开始前重置 AI 的临时交互状态，避免上一轮残留状态污染本轮。
             ai.reset_interaction_state()
 
             if messages is None:
@@ -2550,6 +2616,7 @@ def run_interactive_loop(
                         console.print(
                             f"[bold yellow]Adding file {file_path} to context[/bold yellow]"
                         )
+                # 第一轮需要构造完整消息：system prompt、用户问题、runbook、附加文件等。
                 messages = build_initial_ask_messages(
                     user_input,
                     include_files,
@@ -2559,6 +2626,7 @@ def run_interactive_loop(
                     prompt_component_overrides=prompt_component_overrides,
                 )
             else:
+                # 后续轮次只需要把新的用户消息追加到已有对话历史里。
                 messages.append({"role": "user", "content": user_input})
 
             escape_hint = (
@@ -2569,6 +2637,7 @@ def run_interactive_loop(
             console.print()  # blank line before progress
 
             # Snapshot messages before the call so we can rollback on interrupt
+            # 先拍一份快照；如果用户中途打断，需要把对话回滚到本轮调用前的状态。
             messages_snapshot = list(messages)
 
             cancel_event = threading.Event()
@@ -2577,6 +2646,8 @@ def run_interactive_loop(
             # and blocks; main thread runs the interactive prompt and sends back
             # the decisions.  This avoids terminal conflicts between Rich Live
             # (main thread) and prompt_toolkit (also needs the main thread).
+            # 这里把“模型流式调用”和“用户审批输入”拆到不同线程协调，
+            # 是为了避免 Rich Live 和 prompt_toolkit 同时抢主线程终端控制权。
             approval_pending_event = threading.Event()  # bg → main: "I need approval"
             approval_done_event = threading.Event()     # main → bg: "decisions ready"
             approval_data: List[Optional[List[dict]]] = [None]  # pending_approvals list
@@ -2610,6 +2681,7 @@ def run_interactive_loop(
                         # Replicate the approval loop from call()
                         tool_decisions: Optional[List[ToolApprovalDecision]] = None
                         while True:
+                            # 持续消费流式事件；如果中途遇到审批请求，会暂停并等待主线程给决定。
                             stream = ai.call_stream(
                                 msgs=_messages,
                                 enable_tool_approval=_has_approval,
@@ -2644,7 +2716,7 @@ def run_interactive_loop(
                                 approval_data[0] = td["pending_approvals"]
                                 approval_done_event.clear()
                                 approval_pending_event.set()
-                                # Block until main thread fills in decisions
+                                # 在后台线程阻塞等待主线程完成审批，避免直接在这里弹交互输入。
                                 approval_done_event.wait()
                                 tool_decisions = approval_decisions[0]
                                 approval_decisions[0] = None
@@ -2666,6 +2738,7 @@ def run_interactive_loop(
 
                 # Start escape listener in a background thread so the main
                 # thread can render events from the queue.
+                # Escape 监听也放到后台，这样主线程可以专注渲染流式事件。
                 escape_stop = threading.Event()
                 escape_thread = threading.Thread(
                     target=_wait_for_completion_or_escape,
@@ -2675,6 +2748,7 @@ def run_interactive_loop(
                 escape_thread.start()
 
                 # --- Main thread: render stream events while monitoring for escape ---
+                # 主线程负责实时渲染模型/工具事件，同时检查用户是否请求中断。
                 progress = AgenticProgressRenderer(console, tool_number_offset, escape_hint)
                 progress.start()
                 all_tool_calls_this_turn: list[dict] = []
@@ -2703,6 +2777,7 @@ def run_interactive_loop(
                     )
 
                     if event.event == StreamEvents.ANSWER_END:
+                        # 最终答案事件会带回完整终态数据，后面会据此重建 LLMResult。
                         terminal_data = event.data
                         total_num_llm_calls = terminal_data.get("num_llm_calls", 0)
                         accumulated_stats += RequestStats(**terminal_data.get("costs", {}))
@@ -2716,13 +2791,16 @@ def run_interactive_loop(
                         approval_pending_event.clear()
 
                         # 1. Pause Live display
+                        # 先暂停 live 渲染，否则审批输入界面会和进度渲染互相覆盖。
                         progress.pause_for_approval()
 
                         # 2. Stop escape listener (it holds terminal in cbreak)
+                        # escape 监听会占用终端模式，因此审批前要先停掉。
                         escape_stop.set()
                         escape_thread.join(timeout=2.0)
 
                         # 3. Run approval prompt on main thread
+                        # 审批提示必须在主线程跑，prompt_toolkit 对主线程终端控制更稳定。
                         pending = approval_data[0] or []
                         decisions = ai._prompt_for_approval_decisions(
                             pending, approval_callback
@@ -2731,6 +2809,7 @@ def run_interactive_loop(
                         approval_done_event.set()
 
                         # 4. Resume progress renderer and escape listener
+                        # 审批结束后恢复实时渲染和 escape 中断监听，继续后续流式调用。
                         progress.resume_after_approval()
 
                         escape_stop = threading.Event()
@@ -2748,6 +2827,7 @@ def run_interactive_loop(
                 escape_thread.join(timeout=2.0)
 
                 if interrupted or isinstance(call_error[0], LLMInterruptedError):
+                    # 被打断时回滚消息历史，避免把一轮未完成的回答残留进上下文。
                     messages = messages_snapshot
                     console.print(
                         f"[bold {STATUS_COLOR}]Interrupted.[/bold {STATUS_COLOR}]\n"
@@ -2760,6 +2840,7 @@ def run_interactive_loop(
                     raise Exception("Stream ended without ANSWER_END")
 
                 # Build LLMResult from stream data
+                # 同一轮里工具调用事件可能被多次更新，这里按 tool_call_id 去重后再组装最终结果。
                 deduped: dict[str, dict] = {}
                 for tc in all_tool_calls_this_turn:
                     deduped[tc.get("tool_call_id", id(tc))] = tc
@@ -2779,14 +2860,17 @@ def run_interactive_loop(
 
             messages = response.messages
             last_response = response
+            # 把这一轮问答写进反馈元数据，后续如果用户提交反馈就能关联到具体回答。
             feedback.metadata.add_llm_response(user_input, response.result)
 
             if response.tool_calls:
                 all_tool_calls_history.extend(response.tool_calls)
                 # Update the show completer with the latest tool call history
+                # 更新 `/show` 命令的补全候选，让用户能查看最新工具输出。
                 show_completer.update_history(all_tool_calls_history)
 
             if show_tool_output and response.tool_calls:
+                # 如果打开了自动展示工具输出，就在回答前先把最近的工具结果打印出来。
                 display_recent_tool_outputs(
                     response.tool_calls, console, all_tool_calls_history
                 )
@@ -2804,6 +2888,7 @@ def run_interactive_loop(
 
             # Save conversation after each AI response
             if json_output_file and messages:
+                # 每轮回答后落盘一次，尽量减少中途中断导致的会话丢失。
                 save_conversation_to_file(
                     json_output_file, messages, all_tool_calls_history, console
                 )
@@ -2824,4 +2909,5 @@ def run_interactive_loop(
             # Print trace URL for debugging (works for both success and error cases)
             trace_url = tracer.get_trace_url()
             if trace_url:
+                # 不论成功还是失败，都尽量把 trace 链接打印出来，方便回溯问题。
                 console.print(f"🔍 View trace: {trace_url}")

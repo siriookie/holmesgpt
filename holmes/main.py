@@ -182,16 +182,18 @@ def _investigate_issue(
 # TODO: add streaming output
 @app.command()
 def ask(
+    # 用户直接在命令行里输入的问题正文。
     prompt: Optional[str] = typer.Argument(
         None, help="What to ask the LLM (user prompt)"
     ),
+    # 允许从文件读取 prompt，适合长文本输入。
     prompt_file: Optional[Path] = typer.Option(
         None,
         "--prompt-file",
         "-pf",
         help="File containing the prompt to ask the LLM (overrides the prompt argument if provided)",
     ),
-    # common options
+    # ask 命令复用的通用配置项。
     api_key: Optional[str] = opt_api_key,
     model: Optional[str] = opt_model,
     fast_model: Optional[str] = opt_fast_model,
@@ -200,15 +202,17 @@ def ask(
     max_steps: Optional[int] = opt_max_steps,
     verbose: Optional[List[bool]] = opt_verbose,
     log_costs: bool = opt_log_costs,
-    # semi-common options
+    # ask 命令常用但并非所有命令共享的参数。
     destination: Optional[DestinationType] = opt_destination,
     slack_token: Optional[str] = opt_slack_token,
     slack_channel: Optional[str] = opt_slack_channel,
+    # 调试时可展示每个工具调用的原始输出。
     show_tool_output: bool = typer.Option(
         False,
         "--show-tool-output",
         help="Advanced. Show the output of each tool that was called",
     ),
+    # 把本地文件内容附加到模型上下文中。
     include_file: Optional[List[Path]] = typer.Option(
         [],
         "--file",
@@ -217,37 +221,44 @@ def ask(
     ),
     json_output_file: Optional[str] = opt_json_output_file,
     echo_request: bool = opt_echo_request,
+    # 是否进入交互模式；脚本执行时通常会关闭。
     interactive: bool = typer.Option(
         True,
         "--interactive/--no-interactive",
         "-i/-n",
         help="Enter interactive mode after the initial question? For scripting, disable this with --no-interactive",
     ),
+    # 是否强制刷新 toolset 状态缓存。
     refresh_toolsets: bool = typer.Option(
         False,
         "--refresh-toolsets",
         help="Refresh the toolsets status",
     ),
+    # 把本次执行接入 tracing 后端，便于排查链路。
     trace: Optional[str] = typer.Option(
         None,
         "--trace",
         help="Enable tracing to the specified provider (e.g., 'braintrust')",
     ),
+    # 额外附加到 system prompt 的说明。
     system_prompt_additions: Optional[str] = typer.Option(
         None,
         "--system-prompt-additions",
         help="Additional content to append to the system prompt",
     ),
+    # 自动拒绝所有未允许的 bash 调用。
     bash_always_deny: bool = typer.Option(
         False,
         "--bash-always-deny",
         help="Auto-deny all bash commands not in allow list without prompting",
     ),
+    # 自动允许 bash 调用，适合已知安全的环境。
     bash_always_allow: bool = typer.Option(
         False,
         "--bash-always-allow",
         help="Bypass bash command approval checks. Recommended only for sandboxed environments",
     ),
+    # 快速模式下跳过 TodoWrite 相关提示。
     fast_mode: bool = typer.Option(
         False,
         "--fast-mode",
@@ -257,21 +268,27 @@ def ask(
     """
     Ask any question and answer using available tools
     """
-    # Validate mutually exclusive flags
+    # 这两个开关语义相反，所以必须在入口处做互斥校验。
+    # 原因是如果两者同时为真，后续执行层无法判断 bash 到底该统一放行还是统一拒绝。
     if bash_always_deny and bash_always_allow:
         raise typer.BadParameter(
             "--bash-always-deny and --bash-always-allow are mutually exclusive. Choose one."
         )
 
+    # 初始化控制台日志输出；后续所有 CLI 展示都依赖这个 console。
     console = init_logging(verbose, log_costs)  # type: ignore
-    # Detect and read piped input
+    # 用于保存通过 stdin 管道传入的文本内容。
     piped_data = None
 
-    # when attaching a pycharm debugger sys.stdin.isatty() returns false and sys.stdin.read() is stuck
+    # PyCharm 调试时 `isatty()` 可能返回 False，但此时并不一定真的有管道输入。
+    # 如果直接 `read()`，调试过程可能卡住，所以要把这个场景排除掉。
     running_from_pycharm = os.environ.get("PYCHARM_HOSTED", False)
 
+    # 非 TTY 且不是 PyCharm 调试时，通常意味着输入来自管道。
     if not sys.stdin.isatty() and not running_from_pycharm:
         piped_data = sys.stdin.read().strip()
+        # 管道输入会先消费 stdin，因此不再适合进入交互模式。
+        # 原因是交互模式后续还要继续读 stdin，容易出现无输入可读或行为异常。
         if interactive:
             console.print(
                 "[bold yellow]Interactive mode disabled when reading piped input[/bold yellow]"
@@ -281,8 +298,11 @@ def ask(
     # Silence display loggers early for interactive mode so that
     # init messages are rendered via the InitProgressRenderer instead.
     if interactive:
+        # 提前静默这些 logger，避免它们和 Rich 的实时渲染争抢终端输出。
+        # 这么做能减少交互模式下的闪烁、错位和重复输出。
         silence_display_loggers()
 
+    # 把配置文件、环境变量和 CLI 参数合并成最终运行配置。
     config = Config.load_from_file(
         config_file,
         api_key=api_key,
@@ -294,57 +314,70 @@ def ask(
         slack_channel=slack_channel,
     )
 
-    # Create tracer if trace option is provided
+    # 创建 tracer；即使没有配置 provider，也让后续逻辑始终走统一接口。
     tracer = TracingFactory.create_tracer(trace, project="HolmesGPT-CLI")
+    # 开始一次新的实验/会话，用来聚合这次 ask 的完整链路。
     tracer.start_experiment()
 
+    # prompt 和 prompt_file 代表同一份输入来源，只允许二选一。
     if prompt_file and prompt:
         raise typer.BadParameter(
             "You cannot provide both a prompt argument and a prompt file. Please use one or the other."
         )
     elif prompt_file:
+        # 先验证文件存在，尽早给出明确错误。
         if not prompt_file.is_file():
             raise typer.BadParameter(f"Prompt file not found: {prompt_file}")
+        # 读取文件内容作为最终 prompt。
         with prompt_file.open("r") as f:
             prompt = f.read()
+        # 显示提示，帮助用户确认当前实际使用的是文件里的内容。
         console.print(
             f"[bold yellow]Loaded prompt from file {prompt_file}[/bold yellow]"
         )
+    # 非交互模式下如果没有 prompt，也没有管道输入，就没有可执行内容。
     elif not prompt and not interactive and not piped_data:
         raise typer.BadParameter(
             "Either the 'prompt' argument or the --prompt-file option must be provided (unless using --interactive mode)."
         )
 
-    # Handle piped data
+    # 把 stdin 输入包装进 prompt，让模型知道这是待分析的上下文文本。
     if piped_data:
         if prompt:
-            # User provided both piped data and a prompt
+            # 如果用户同时给了问题和管道输入，就把两者拼接起来。
             prompt = f"Here's some piped output:\n\n{piped_data}\n\n{prompt}"
         else:
-            # Only piped data, no prompt - ask what to do with it
+            # 只有管道输入时补一个默认问题，避免模型缺少明确任务指令。
             prompt = f"Here's some piped output:\n\n{piped_data}\n\nWhat can you tell me about this output?"
 
+    # 非交互模式下可以把最终请求回显出来，方便脚本日志回放。
     if echo_request and not interactive and prompt:
         console.print(f"[bold {USER_COLOR}]User:[/bold {USER_COLOR}] {prompt}")
 
-    # Build prompt component overrides for fast mode
+    # 默认不覆盖 prompt 组件。
     prompt_component_overrides = None
     if fast_mode:
+        # 快速模式关闭 TodoWrite 相关提示，减少规划步骤带来的额外 token 和等待时间。
         prompt_component_overrides = {
             PromptComponent.TODOWRITE_INSTRUCTIONS: False,
             PromptComponent.TODOWRITE_REMINDER: False,
         }
 
+    # 为本轮 ask 创建临时工具结果目录，退出 `with` 时会自动清理。
     with tool_result_storage() as tool_results_dir:
+        # 只有交互模式会用到初始化阶段的进度渲染器。
         init_renderer = None
         on_event = None
         if interactive:
+            # 在创建 LLM 前先显示初始化进度，让用户知道程序正在准备工具和模型。
             init_renderer = InitProgressRenderer(
                 console, model_name=model or config.model or ""
             )
+            # 把初始化事件回调交给后续组件，用于更新进度显示。
             on_event = init_renderer.on_event
             init_renderer.start()
 
+        # 创建真正执行 ask 的 ToolCallingLLM 实例。
         ai = config.create_console_toolcalling_llm(
             dal=None,  # type: ignore
             refresh_toolsets=refresh_toolsets,  # flag to refresh the toolset status
@@ -355,9 +388,11 @@ def ask(
         )
 
         if init_renderer is not None:
+            # 初始化完成后及时停止渲染器，避免继续占用终端渲染区域。
             init_renderer.stop()
 
         if interactive:
+            # 交互模式下把控制权交给 REPL 循环，后面的非交互分支不再执行。
             run_interactive_loop(
                 ai,
                 console,
@@ -378,10 +413,12 @@ def ask(
 
         if include_file:
             for file_path in include_file:
+                # 让用户看到哪些文件会进入上下文，方便确认输入范围是否符合预期。
                 console.print(
                     f"[bold yellow]Adding file {file_path} to context[/bold yellow]"
                 )
 
+        # 构造首轮 ask 的消息列表，内部会合并 prompt、附加文件、tool 信息和 runbook。
         messages = build_initial_ask_messages(
             prompt,  # type: ignore
             include_file,
@@ -391,21 +428,30 @@ def ask(
             prompt_component_overrides=prompt_component_overrides,
         )
 
+        # 用 trace span 包裹整个 ask 调用，记录输入、输出和链路元数据。
         with tracer.start_trace(
             f'holmes ask "{prompt}"', span_type=SpanType.TASK
         ) as trace_span:
+            # 记录用户输入，便于事后复盘这次调用的上下文。
             trace_span.log(input=prompt, metadata={"type": "user_question"})
+            # 调用模型执行完整的工具推理流程。
             response = ai.call(messages, trace_span=trace_span)
+            # 把最终输出也记入 trace，形成完整闭环。
             trace_span.log(
                 output=response.result,
             )
+            # 如果 tracing 后端支持外链，这里取回可展示的地址。
             trace_url = tracer.get_trace_url()
 
+        # 用响应中的完整消息历史覆盖本地变量，便于后续保存完整上下文。
         messages = response.messages  # type: ignore # Update messages with the full history
 
         if json_output_file:
+            # 用户要求导出 JSON 时，写出完整结构化响应结果。
             write_json_file(json_output_file, response.model_dump())
 
+        # 把 ask 结果包装成统一的 Issue 对象，复用已有的结果处理链路。
+        # 这样 ask / investigate 虽然入口不同，但展示与下游投递逻辑可以保持一致。
         issue = Issue(
             id=str(uuid.uuid4()),
             name=prompt,  # type: ignore
@@ -413,6 +459,7 @@ def ask(
             raw={"prompt": prompt, "full_conversation": messages},
             source_instance_id=socket.gethostname(),
         )
+        # 统一处理最终输出，包含终端展示、目标投递以及可选的工具输出信息。
         handle_result(
             response,
             console,

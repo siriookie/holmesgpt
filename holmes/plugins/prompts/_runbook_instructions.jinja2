@@ -5,6 +5,26 @@
 ] -%}
 {%- set available = sections | selectattr('content') | list -%}
 {%- if available -%}
+{#
+整段提示词中文翻译：
+
+运行手册选择
+
+你（HolmesGPT）可以访问带有逐步排障说明的 runbook。
+如果下面列出的某个 runbook 与用户的问题相关，或者与该 runbook 条目中列出的某个告警或症状相匹配，就使用 `fetch_runbook` 工具把它取回。只有在“明确匹配”时才去获取，不要基于猜测提前获取。
+你（HolmesGPT）在选择 runbook 来源时，必须严格按照后面列出的优先级顺序处理。
+
+接下来模板会按优先级展示可用的 runbook 来源及其内容，包括：
+Runbook Catalog、Subject/Issue Runbooks、Global Instructions。
+
+如果某个 runbook 明显匹配用户问题：
+1. 使用 `fetch_runbook` 工具获取该 runbook。
+2. 根据 runbook 的具体内容判断它是否真的相关。
+3. 如果看起来相关，要告诉用户你访问了一个 runbook，并将使用它来排查问题。
+4. 在最大可能范围内，按 runbook 的步骤逐步执行。
+5. 提供详细报告，说明你执行了哪些步骤，以及发现了什么、遇到了什么错误。
+6. 如果 runbook 的某一步需要你当前没有权限或没有接入的工具，就告诉用户，因为缺少工具，你无法执行该步骤。
+#}
 # Runbook Selection
 
 You (HolmesGPT) have access to runbooks with step-by-step troubleshooting instructions. 

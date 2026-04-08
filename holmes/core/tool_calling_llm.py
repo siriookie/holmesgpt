@@ -147,11 +147,11 @@ ApprovalCallback = Callable[[PendingToolApproval], tuple[bool, Optional[str]]]
 
 class LLMResult(RequestStats):
     tool_calls: Optional[List[ToolCallResult]] = None
-    num_llm_calls: Optional[int] = None  # Number of LLM API calls (turns)
-    result: Optional[str] = None
+    num_llm_calls: Optional[int] = None   # 一共调了几轮 LLM
+    result: Optional[str] = None           # 最终答案文本
     unprocessed_result: Optional[str] = None
     instructions: List[str] = Field(default_factory=list)
-    messages: Optional[List[dict]] = None
+    messages: Optional[List[dict]] = None  # 完整对话历史（含工具调用记录）
     metadata: Optional[Dict[Any, Any]] = None
 
 
@@ -237,30 +237,46 @@ class ToolCallingLLM:
         Returns:
             Updated messages list with tool execution results and stream events.
         """
+        # 如果上层没有传 trace span，就退化成空 span，保证后续工具执行埋点逻辑可统一复用。
         if trace_span is None:
             trace_span = DummySpan()
 
+        # 收集本次“审批后恢复执行”阶段要回放给客户端的事件。
         events: list[StreamMessage] = []
+        # 没有任何审批结果时，直接原样返回，不做额外处理。
         if not tool_decisions:
             return messages, events
 
         # Create decision lookup
+        # 把用户对每个 tool_call 的审批结果按 tool_call_id 建索引，
+        # 这样后面在消息历史里回找 pending tool call 时可以 O(1) 取到对应决定。
         decisions_by_tool_call_id = {
             decision.tool_call_id: decision for decision in tool_decisions
         }
 
+        # 收集消息历史里所有仍处于 pending_approval 状态的工具调用，
+        # 后面会逐个根据 decision 执行或构造拒绝结果。
         pending_tool_calls: list[ToolCallWithDecision] = []
 
+        # 倒序扫描 messages。
+        # 这样做的原因是：后面会往 assistant tool_call 请求后面插入 tool result，
+        # 倒序处理可以减少前面插入对后续 message_index 的影响。
         for i in reversed(range(len(messages))):
             msg = messages[i]
+            # 只关心带 tool_calls 的 assistant 消息，因为 pending approval 标记挂在这里。
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 message_tool_calls = msg.get("tool_calls", [])
                 for tool_call in message_tool_calls:
+                    # 先按 tool_call id 查找用户的审批结果；理论上每个 pending tool_call 都应有对应 decision。
                     decision = decisions_by_tool_call_id.get(tool_call.get("id"), None)
                     if tool_call.get("pending_approval"):
+                        # 一旦准备恢复处理，就先把 pending_approval 标记清掉，
+                        # 避免这条消息在未来再次被当成“还没审批”的请求重复处理。
                         del tool_call[
                             "pending_approval"
                         ]  # Cleanup so that a pending approval is not tagged on message in a future response
+                        # 保存恢复执行所需的完整信息：
+                        # 原始 tool_call、用户 decision、以及这条 assistant 消息所在位置。
                         pending_tool_calls.append(
                             ToolCallWithDecision(
                                 tool_call=ChatCompletionMessageToolCall(**tool_call),
@@ -270,17 +286,27 @@ class ToolCallingLLM:
                         )
 
         if not pending_tool_calls:
+            # 如果客户端传回了 decision，但历史里已经找不到 pending approval，
+            # 说明消息状态和客户端状态不同步了，这属于逻辑异常，直接报错更安全。
             error_message = f"Received {len(tool_decisions)} tool decisions but no pending approvals found"
             logging.error(error_message)
             raise Exception(error_message)
         # Extract existing session prefixes from conversation history
+        # 恢复会话级 bash 已批准前缀。
+        # 这样“本次批准并记住前缀”的效果可以立刻影响同一次恢复流程中的后续命令。
         session_prefixes = extract_bash_session_prefixes(messages)
 
+        # 逐个处理待恢复的工具调用：批准则真正执行，拒绝则构造一个错误结果返回给模型。
         for tool_call_with_decision in pending_tool_calls:
+            # 取出原始工具调用对象。
             tool_call = tool_call_with_decision.tool_call
+            # 取出这个工具调用对应的审批决定。
             decision = tool_call_with_decision.decision
+            # 先初始化结果变量，后面无论批准还是拒绝都要产出一个 ToolCallResult。
             tool_result: Optional[ToolCallResult] = None
             if decision and decision.approved:
+                # 用户批准后，重新真正执行这条工具调用。
+                # 这里显式传 user_approved=True，避免再次卡在审批环节。
                 tool_result = self._invoke_llm_tool_call(
                     tool_to_call=tool_call,
                     previous_tool_calls=[],
@@ -293,6 +319,8 @@ class ToolCallingLLM:
                 )
             else:
                 # Tool was rejected or no decision found, add rejection message
+                # 用户拒绝，或者根本没有找到 decision 时，统一转成一个错误型 tool result。
+                # 这样模型后续能读到“这条工具调用被用户拒绝”这个事实，而不是静默消失。
                 feedback_text = f" User feedback: {decision.feedback}" if decision and decision.feedback else ""
                 tool_result = ToolCallResult(
                     tool_call_id=tool_call.id,
@@ -304,6 +332,8 @@ class ToolCallingLLM:
                     ),
                 )
 
+            # 不论最终是批准执行还是拒绝，都向客户端发一个 TOOL_RESULT 事件。
+            # 这样前端/CLI 才能完整展示恢复阶段发生了什么。
             events.append(
                 StreamMessage(
                     event=StreamEvents.TOOL_RESULT,
@@ -312,6 +342,8 @@ class ToolCallingLLM:
             )
 
             # If user chose "Yes, and don't ask again", include prefixes in metadata
+            # 如果用户选择了“批准并记住前缀”，就把这些前缀写进 tool result metadata，
+            # 后续 extract_bash_session_prefixes 可以从消息历史中把它们恢复出来。
             extra_metadata = None
             if decision and decision.approved and decision.save_prefixes:
                 logging.info(
@@ -321,6 +353,7 @@ class ToolCallingLLM:
                     "bash_session_approved_prefixes": decision.save_prefixes
                 }
 
+            # 把工具结果转成 LLM 可消费的 tool message，准备插回对话历史。
             tool_call_message = tool_result.to_llm_message(
                 extra_metadata=extra_metadata,
                 supports_vision=self._supports_vision(),
@@ -329,10 +362,14 @@ class ToolCallingLLM:
             # It is expected that the tool call result directly follows the tool call request from the LLM
             # The API call may contain a user ask which is appended to the messages so we can't just append
             # tool call results; they need to be inserted right after the llm's message requesting tool calls
+            # 这里必须 insert，而不是 append。
+            # 原因是 OpenAI 风格的消息序列要求：tool result 必须紧跟在发起该 tool_call 的 assistant 消息之后。
+            # 如果简单 append，而这期间消息末尾又有新的 user 消息，消息顺序就会错，模型可能无法正确关联工具结果。
             messages.insert(
                 tool_call_with_decision.message_index + 1, tool_call_message
             )
 
+        # 返回插入了恢复后 tool result 的最新消息历史，以及需要回放给客户端的事件列表。
         return messages, events
 
     @staticmethod
@@ -866,72 +903,107 @@ class ToolCallingLLM:
         stream with an APPROVAL_REQUIRED event containing pending_frontend_tool_calls.
         The client executes the tool and resumes by sending frontend_tool_results.
         """
+        # 如果调用方没有传 trace span，就退化成一个空实现，保证后续埋点代码不用到处判空。
         if trace_span is None:
             trace_span = DummySpan()
 
+        # 汇总本次流式调用全过程中产生过的所有工具调用结果。
+        # 最终 ANSWER_END 会把它们一并返回给上层。
         all_tool_calls: list[dict] = []
 
         # Process tool decisions if provided (approval resume)
+        # 如果这是一次“审批后恢复”的调用，那么先把上一轮等待用户确认的工具执行掉，
+        # 并把对应结果重新注入到消息历史里，然后再继续后续 LLM 迭代。
         if msgs and tool_decisions:
             logging.info(f"Processing {len(tool_decisions)} tool decisions")
             msgs, events = self._execute_tool_decisions(
                 msgs, tool_decisions, request_context, trace_span=trace_span
             )
             for ev in events:
+                # 先把恢复阶段产生的事件原样流给调用方，这样前端/CLI 能看到完整过程。
                 yield ev
                 # Collect tool results from approval re-invocations
                 if ev.event == StreamEvents.TOOL_RESULT:
+                    # 这些是审批通过后真正执行出来的工具结果，也应计入最终总结果。
                     all_tool_calls.append(ev.data)
 
         # Process frontend tool results if provided (frontend tool resume)
+        # 如果这是一次“前端工具执行后恢复”的调用，先把客户端回传的工具结果补回消息历史，
+        # 这样模型下一轮推理就能基于这些结果继续往下走。
         if msgs and frontend_tool_results:
             logging.info(f"Processing {len(frontend_tool_results)} frontend tool results")
             msgs, events = self._process_frontend_tool_results(msgs, frontend_tool_results)
             for ev in events:
+                # 同样要把恢复阶段的事件继续往外发，保证事件流完整。
                 yield ev
                 if ev.event == StreamEvents.TOOL_RESULT:
+                    # 前端工具结果也要进入本轮 all_tool_calls 汇总。
                     all_tool_calls.append(ev.data)
 
+        # 拷贝一份消息列表作为当前工作上下文，避免直接修改调用方传入的原列表引用。
         messages: list[dict] = list(msgs) if msgs else []
+        # 记录当前这次推理链路中已经执行过的工具调用，用于重复调用检测等逻辑。
         tool_calls: list[dict] = []
+        # 取出当前可供模型调用的工具列表。
+        # 注意后续 runbook 激活后，这个列表可能会动态刷新。
         tools: Optional[list] = self._get_tools()
+        # 最大允许的 LLM 迭代步数，防止模型无限循环调用工具。
         max_steps = self.max_steps
+        # 用于向客户端累积透传 token / compaction 等元信息。
         metadata: Dict[Any, Any] = {}
+        # 累积整个调用过程的 token、cost、compaction 等用量统计。
         stats = RequestStats()
+        # 恢复流式调用时，iteration_offset 代表之前已经走过多少轮 LLM 调用；
+        # 这里做非负校验，防止上层传入非法偏移导致计数错乱。
         if iteration_offset < 0:
             raise ValueError("iteration_offset must be non-negative")
+        # i 表示当前已经完成的 LLM 轮次计数，初始化为恢复偏移量。
         i = iteration_offset
 
+        # 主循环：每一轮做一次“必要压缩 -> 调 LLM -> 执行工具或结束”的闭环。
         while i < max_steps:
+            # 支持外部中断；一旦用户取消，立即抛出专用异常终止本轮。
             if cancel_event and cancel_event.is_set():
                 raise LLMInterruptedError()
 
+            # 进入新的一轮 LLM 调用。
             i += 1
             logging.debug(f"running iteration {i}")
 
+            # 到最后一轮时强制关闭工具调用，只允许模型给出最终答案。
+            # 这样做是为了在接近 max_steps 上限时尽量收敛，而不是继续要求新工具。
             tools = None if i == max_steps else tools
+            # 只要还有工具可用，就让模型自动决定是否要调工具；否则不传 tool_choice。
             tool_choice = "auto" if tools else None
 
+            # 先做一次“是否需要压缩上下文”的预检查，必要时给前端一个开始压缩的事件。
             compaction_start_event = check_compaction_needed(self.llm, messages, tools)
             if compaction_start_event:
                 yield compaction_start_event
 
             try:
+                # 真正执行上下文压缩，确保消息和工具描述能塞进当前模型上下文窗口。
                 limit_result = compact_if_necessary(
                     llm=self.llm, messages=messages, tools=tools
                 )
             except CompactionInsufficientError as e:
+                # 如果压缩后仍然塞不下，就把压缩阶段已经产生的事件先发出去，
+                # 并把压缩消耗记入 stats，然后把异常继续抛给上层处理。
                 yield from e.events
                 if e.compaction_usage and e.compaction_usage.total_tokens > 0:
                     stats += e.compaction_usage
                 raise
 
+            # 把压缩过程里产生的所有事件继续流式输出。
             yield from limit_result.events
+            # 用压缩后的消息替换当前上下文，后续 LLM 调用都基于这份精简结果。
             messages = limit_result.messages
+            # 合并压缩阶段产生的元信息，保留已有 metadata 并叠加新值。
             metadata = metadata | limit_result.metadata
 
             # After compaction, emit a fresh token count so clients can update
             if limit_result.conversation_history_compacted:
+                # 历史被压缩后，原有 token 统计已经过期，需要立刻补发一次最新 token 数。
                 yield build_stream_event_token_count(
                     metadata={
                         "tokens": limit_result.tokens.model_dump(),
@@ -941,8 +1013,10 @@ class ToolCallingLLM:
                 )
 
             # Accumulate compaction costs
+            # 把压缩本身消耗的 token/cost 计入总账，避免最终统计漏掉压缩成本。
             compaction = limit_result.compaction_usage
             if compaction and compaction.total_tokens > 0:
+                # 一次 compact_if_necessary 视为一次 compaction。
                 compaction.num_compactions = 1
                 stats += compaction
                 cost_logger.debug(
@@ -954,11 +1028,15 @@ class ToolCallingLLM:
                 limit_result.conversation_history_compacted
                 and RESET_REPEATED_TOOL_CALL_CHECK_AFTER_COMPACTION
             ):
+                # 历史压缩后，重复调用检测可能失去一部分上下文。
+                # 在开启该开关时，直接重置 tool_calls，避免基于不完整历史误判“重复调用”。
                 tool_calls = []
 
             logging.debug(f"sending messages={messages}\n\ntools={tools}")
 
             try:
+                # 注意这里不是底层 token 级流式，而是“每轮一个完整响应”的迭代流。
+                # Holmes 自己把多轮 LLM + tool use 组织成事件流，便于统一控制审批、前端暂停等状态。
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),  # type: ignore
                     tools=tools,
@@ -970,6 +1048,7 @@ class ToolCallingLLM:
                 )
 
                 # Accumulate cost information for this iteration
+                # 把这一轮 LLM completion 的 usage/cost 提取出来并累计。
                 response_stats = RequestStats.from_response(full_response)
                 if response_stats.total_tokens > 0:
                     cost_logger.debug(
@@ -986,6 +1065,7 @@ class ToolCallingLLM:
 
             # catch a known error that occurs with Azure and replace the error message with something more obvious to the user
             except BadRequestError as e:
+                # 对 Azure 某些不支持 tools 的模型给出更直白的报错，方便用户定位模型版本问题。
                 if "Unrecognized request arguments supplied: tool_choice, tools" in str(
                     e
                 ):
@@ -999,6 +1079,7 @@ class ToolCallingLLM:
                     )
                     raise
             except Exception as e:
+                # 其余异常直接记录完整上下文后抛出，交给上层统一处理。
                 logging.error(
                     f"LLM call failed on model={self.llm.model} (streaming iteration {i}): "
                     f"{type(e).__name__}: {e}",
@@ -1006,21 +1087,28 @@ class ToolCallingLLM:
                 )
                 raise
 
+            # completion 返回后再检查一次取消状态，避免在慢请求结束后继续推进后续逻辑。
             if cancel_event and cancel_event.is_set():
                 raise LLMInterruptedError()
 
+            # 取出本轮 assistant message，它可能包含普通文本，也可能包含 tool_calls。
             response_message = full_response.choices[0].message  # type: ignore
 
+            # 先把 assistant 消息写回对话历史。
+            # 这样无论后面是直接结束还是继续调工具，messages 都保持完整链路。
             messages.append(
                 response_message.model_dump(
                     exclude_defaults=True, exclude_unset=True, exclude_none=True
                 )
             )
 
+            # 在 assistant 消息入历史后，立刻发一次最新 token 统计。
             yield self._emit_token_count(messages, tools, full_response, limit_result, metadata, stats)
 
+            # 看本轮模型是否请求了工具调用。
             tools_to_call = getattr(response_message, "tool_calls", None)
             if not tools_to_call:
+                # 没有工具调用，说明模型给出的就是最终回答，直接结束本次流。
                 yield StreamMessage(
                     event=StreamEvents.ANSWER_END,
                     data={
@@ -1035,6 +1123,7 @@ class ToolCallingLLM:
                 )
                 return
 
+            # 如果模型在发起工具前先输出了 reasoning 或普通文本，也要把它们通过 AI_MESSAGE 发给前端。
             reasoning = getattr(response_message, "reasoning_content", None)
             message = response_message.content
             if reasoning or message:
@@ -1048,17 +1137,25 @@ class ToolCallingLLM:
                 )
 
             # Check if any tools require approval or are frontend-defined
+            # 收集这批工具里需要用户审批的调用。
             pending_approvals = []
+            # 收集这批工具里需要前端本地执行的调用。
             pending_frontend_calls: list[PendingFrontendToolCall] = []
 
             # Extract session approved prefixes from conversation history
+            # 从既有消息历史里恢复本会话已批准的 bash 前缀，
+            # 这样后续同前缀命令可以在同一轮或后续轮次中自动放行。
             session_prefixes = extract_bash_session_prefixes(messages)
 
+            # 并发执行本轮所有工具调用，减少整体等待时间。
+            # max_workers 取 16，是一个相对激进但受控的并行上限。
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = []
                 for tool_index, t in enumerate(tools_to_call, 1):  # type: ignore
+                    # 为每个工具生成全局递增的展示编号，方便 UI 侧追踪。
                     tool_number = tool_number_offset + tool_index
 
+                    # 把工具提交给线程池异步执行；实际执行逻辑里会处理重复检测、审批、spill 等细节。
                     future = executor.submit(
                         self._invoke_llm_tool_call,
                         tool_to_call=t,  # type: ignore
@@ -1070,19 +1167,24 @@ class ToolCallingLLM:
                         enable_tool_approval=enable_tool_approval,
                     )
                     futures.append(future)
+                    # 工具一提交就先发 START_TOOL，让前端立刻显示“开始执行”状态，而不是等结果回来。
                     yield StreamMessage(
                         event=StreamEvents.START_TOOL,
                         data={"tool_name": t.function.name, "id": t.id},
                     )
 
+                # 按“谁先完成谁先返回”的顺序消费工具结果，提升感知速度。
                 for future in concurrent.futures.as_completed(futures):
                     if cancel_event and cancel_event.is_set():
+                        # 一旦取消，尽量把尚未开始的 future 取消掉，然后中断整个流程。
                         for f in futures:
                             f.cancel()
                         raise LLMInterruptedError()
 
+                    # 取出单个工具执行结果对象。
                     tool_call_result: ToolCallResult = future.result()
 
+                    # 转成客户端友好的字典形式，后面多个分支都会用到。
                     tool_result_dict = tool_call_result.to_client_dict()
 
                     if (
@@ -1090,6 +1192,8 @@ class ToolCallingLLM:
                         == StructuredToolResultStatus.APPROVAL_REQUIRED
                     ):
                         if enable_tool_approval:
+                            # 开启审批模式时，不立即把这个工具结果喂回 LLM，
+                            # 而是先登记为 pending approval，等待用户确认后再恢复执行。
                             pending_approvals.append(
                                 PendingToolApproval(
                                     tool_call_id=tool_call_result.tool_call_id,
@@ -1099,18 +1203,24 @@ class ToolCallingLLM:
                                 )
                             )
 
+                            # 虽然工具还没真正执行成功，但仍把“需要审批”的结果发给客户端，
+                            # 这样 UI 能展示是哪条命令卡在审批上。
                             all_tool_calls.append(tool_result_dict)
                             yield StreamMessage(
                                 event=StreamEvents.TOOL_RESULT,
                                 data=tool_result_dict,
                             )
                         else:
+                            # 未开启审批模式时，把“需要审批”直接降级成 ERROR，
+                            # 避免模型误以为该工具已经执行成功。
                             tool_call_result.result.status = (
                                 StructuredToolResultStatus.ERROR
                             )
                             tool_call_result.result.error = f"Tool call rejected for security reasons: {tool_call_result.result.error}"
                             tool_result_dict = tool_call_result.to_client_dict()
 
+                            # 这种错误结果要写回本轮工具历史和消息历史，
+                            # 让模型下一轮能看到“该工具因安全原因被拒绝”这个事实。
                             tool_calls.append(tool_result_dict)
                             all_tool_calls.append(tool_result_dict)
                             messages.append(tool_call_result.to_llm_message(supports_vision=self._supports_vision()))
@@ -1125,6 +1235,8 @@ class ToolCallingLLM:
                         == StructuredToolResultStatus.FRONTEND_PAUSE
                     ):
                         # Frontend tool — collect for pause, don't feed result to LLM
+                        # 前端工具不能在后端直接执行，所以这里只记录待前端处理的信息，
+                        # 暂时不把任何结果喂给 LLM。
                         pending_frontend_calls.append(
                             PendingFrontendToolCall(
                                 tool_call_id=tool_call_result.tool_call_id,
@@ -1132,6 +1244,7 @@ class ToolCallingLLM:
                                 arguments=tool_call_result.result.params or {},
                             )
                         )
+                        # 给本轮工具历史保存一个简化对象，便于最终汇总和客户端展示。
                         frontend_call_dict = {
                             "tool_call_id": tool_call_result.tool_call_id,
                             "tool_name": tool_call_result.tool_name,
@@ -1141,21 +1254,25 @@ class ToolCallingLLM:
                         all_tool_calls.append(frontend_call_dict)
 
                     else:
+                        # 正常工具结果：加入本轮历史、加入总历史，并写回 messages 供下一轮 LLM 使用。
                         tool_calls.append(tool_result_dict)
                         all_tool_calls.append(tool_result_dict)
                         messages.append(tool_call_result.to_llm_message())
 
+                        # 同步把工具结果事件流给客户端。
                         yield StreamMessage(
                             event=StreamEvents.TOOL_RESULT,
                             data=tool_result_dict,
                         )
 
                 # Emit updated token counts after tool results
+                # 工具结果写回 messages 后，上下文体积发生变化，因此再补发一次 token 统计。
                 yield self._emit_token_count(messages, tools, full_response, limit_result, metadata, stats)
 
                 # Mark any pending frontend tool calls in assistant messages
                 if pending_frontend_calls:
                     for fc in pending_frontend_calls:
+                        # 在 assistant 原始 tool_call 请求上打标记，方便恢复时精确定位。
                         tool_call = self.find_assistant_tool_call_request(
                             tool_call_id=fc.tool_call_id, messages=messages
                         )
@@ -1164,6 +1281,7 @@ class ToolCallingLLM:
                 # Mark any pending approval tool calls in assistant messages
                 if pending_approvals:
                     for approval in pending_approvals:
+                        # 审批暂停同样通过在原始 assistant tool_call 上打 pending_approval 标记来恢复。
                         tool_call = self.find_assistant_tool_call_request(
                             tool_call_id=approval.tool_call_id, messages=messages
                         )
@@ -1173,6 +1291,8 @@ class ToolCallingLLM:
                 # event that carries both pending_approvals and pending_frontend_tool_calls.
                 # The client checks which lists are populated and handles accordingly.
                 if pending_approvals or pending_frontend_calls:
+                    # 不论是用户审批还是前端本地执行，本质都是“当前轮次必须暂停并等待外部动作”，
+                    # 因此统一用 APPROVAL_REQUIRED 这个事件承载两类 pending 信息。
                     yield StreamMessage(
                         event=StreamEvents.APPROVAL_REQUIRED,
                         data={
@@ -1188,13 +1308,17 @@ class ToolCallingLLM:
                             "costs": stats.model_dump(),
                         },
                     )
+                    # 一旦进入暂停态，本次 call_stream 就先返回；待外部准备好结果后再恢复。
                     return
 
                 # Update the tool number offset for the next iteration
+                # 本轮工具都处理完后，推进全局工具编号偏移量，保证下一轮编号连续。
                 tool_number_offset += len(tools_to_call)
 
                 # Re-fetch tools if runbook was just activated (enables restricted tools)
                 if self._runbook_in_use and tools is not None:
+                    # 某些受限工具在 fetch_runbook 成功后才解锁；
+                    # 因此这里重新取一次工具列表，让后续轮次能看到新开放的工具。
                     new_tools = self._get_tools()
                     if len(new_tools) != len(tools):
                         logging.info(
@@ -1202,6 +1326,7 @@ class ToolCallingLLM:
                         )
                         tools = new_tools
 
+        # 走到这里说明模型连续多轮都没有收敛，超过了允许的最大步数。
         raise Exception(
             f"Too many LLM calls - exceeded max_steps: {i}/{self.max_steps}"
         )
